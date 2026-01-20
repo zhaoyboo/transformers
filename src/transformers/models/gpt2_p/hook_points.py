@@ -119,6 +119,34 @@ class LensHandle:
     context_level: Optional[int] = None
     """Context level associated with the hooks context manager for the given hook."""
 
+@dataclass
+class _NativeHookConfig:
+    """Configuration describing how to register a native monitoring hook."""
+
+    engine: MonitoringEngine
+    remove_batch_dim: bool = False
+    pos_slice: Optional[Union[Slice, SliceInput]] = None
+    device: Optional[torch.device] = None
+
+    def register(
+        self,
+        hook_point: "HookPoint",
+        hook_name: str,
+        *,
+        dir: Literal["fwd", "bwd"],
+        prepend: bool,
+    ) -> hooks.RemovableHandle:
+        cache_name = hook_name if dir == "fwd" else f"{hook_name}_grad"
+        return self.engine.register_native_hook(
+            hook_point,
+            hook_name,
+            cache_name=cache_name,
+            is_backward=(dir == "bwd"),
+            remove_batch_dim=self.remove_batch_dim,
+            pos_slice=self.pos_slice,
+            device=self.device,
+            prepend=prepend,
+        )
 
 # Define type aliases
 NamesFilter = Optional[Union[Callable[[str], bool], Sequence[str], str]]
@@ -161,11 +189,12 @@ class HookPoint(nn.Module):
 
     def add_hook(
         self,
-        hook: HookFunction,
+        hook: Optional[HookFunction],
         dir: Literal["fwd", "bwd"] = "fwd",
         is_permanent: bool = False,
         level: Optional[int] = None,
         prepend: bool = False,
+        native_config: Optional[_NativeHookConfig] = None,
     ) -> None:
         """
         Hook format is fn(activation, hook_name)
@@ -173,6 +202,28 @@ class HookPoint(nn.Module):
         which are the same for a HookPoint)
         If prepend is True, add this hook before all other hooks
         """
+
+        if native_config is not None:
+            if self.name is None:
+                raise ValueError("Native hook registration requires hook point name")
+            if dir not in ("fwd", "bwd"):
+                raise ValueError(f"Invalid direction {dir}")
+            handle_obj = native_config.register(
+                self,
+                self.name,
+                dir=dir,
+                prepend=prepend,
+            )
+            handle = LensHandle(handle_obj, is_permanent, level)
+            visible_hooks = self.fwd_hooks if dir == "fwd" else self.bwd_hooks
+            if prepend:
+                visible_hooks.insert(0, handle)
+            else:
+                visible_hooks.append(handle)
+            return
+
+        if hook is None:
+            raise ValueError("hook cannot be None unless native_config is provided")
 
         def full_hook(
             module: torch.nn.Module,
@@ -689,53 +740,48 @@ class HookedRootModule(nn.Module):
                 pos_slice=pos_slice,
             )
 
-        # 若使用原生全局回调且本步没有需要临时挂载的 hooks，则跳过 hooks 上下文，避免每步 ResetHooks 开销
-        use_ctx = True
-        try:
-            engine = self.monitoring_engine
-            native_backend = getattr(engine, "_native_backend", None) if engine is not None else None
-            native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
-            native_builder_enabled = bool(getattr(engine, "_native_builder_enabled", False))
-            native_callback_enabled = bool(getattr(engine, "_native_callback_enabled", False))
-            native_callback_active = native_using and native_builder_enabled and native_callback_enabled
-            if native_callback_active and not fwd and not bwd:
-                use_ctx = False
-        except Exception:
-            use_ctx = True
+        native_backend = None
+        native_callback_active = False
+        engine = self.monitoring_engine
+        if engine is not None:
+            try:
+                native_backend = getattr(engine, "_native_backend", None)
+                native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
+                native_builder_enabled = bool(getattr(engine, "_native_builder_enabled", False))
+                native_callback_enabled = bool(getattr(engine, "_native_callback_enabled", False))
+                native_callback_active = native_using and native_builder_enabled and native_callback_enabled
+            except Exception:
+                native_callback_active = False
 
-        if use_ctx:
+        native_fast_path = native_callback_active and not fwd and not bwd
+        skip_ctx = native_fast_path or (not fwd and not bwd)
+
+        if skip_ctx:
+            # Forward without transient hook context (either native path or no hooks requested)
+            with _nvtx_range("TL::ModelForward"):
+                model_out = self(*model_args, **model_kwargs)
+                if incl_bwd:
+                    model_out.backward()
+            if clear_contexts:
+                self.clear_contexts()
+        else:
             with self.hooks(
                 fwd_hooks=fwd,
                 bwd_hooks=bwd,
                 reset_hooks_end=reset_hooks_end,
                 clear_contexts=clear_contexts,
             ):
-                # Main forward (and optional backward) on the critical path
                 with _nvtx_range("TL::ModelForward"):
                     model_out = self(*model_args, **model_kwargs)
                     if incl_bwd:
                         model_out.backward()
-        else:
-            # Forward without transient hook context (native global callback active)
-            with _nvtx_range("TL::ModelForward"):
-                model_out = self(*model_args, **model_kwargs)
-                if incl_bwd:
-                    model_out.backward()
 
         # 若使用原生全局回调，前向结束后一次性收集 futures 写入 cache
         try:
-            engine = self.monitoring_engine
             if engine is not None:
                 if hasattr(engine, "is_capture_enabled") and not engine.is_capture_enabled():
                     return model_out, cache_dict
-                native_backend = getattr(engine, "_native_backend", None)
-                native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
-                native_builder_enabled = bool(getattr(engine, "_native_builder_enabled", False))
-                native_batch_enabled = bool(getattr(engine, "_native_batch_enabled", False))
-                native_callback_enabled = bool(getattr(engine, "_native_callback_enabled", False))
-                native_callback_active = native_using and native_builder_enabled and native_callback_enabled
                 if native_callback_active and native_backend is not None:
-                    # Bulk fill Python cache with BackendFutures for this step
                     with _nvtx_range("MonEng::CollectFutures"):
                         step_id_i = int(getattr(engine, "_current_step_id", 0))
                         native_backend.collect_step_futures_into(step_id_i, cache_dict)
@@ -823,36 +869,22 @@ class HookedRootModule(nn.Module):
         if self._native_callbacks_registered:
             return
 
-        try:
-            from monitoring.task import _encode_slice_native  # type: ignore
-        except Exception:
-            _encode_slice_native = None  # type: ignore
-
-        for reg_name, reg_hp in self.hook_dict.items():
-            slice_tuple = _encode_slice_native(pos_slice) if _encode_slice_native is not None else (0,)
-            callback = native_backend.create_global_hook_callback_sig(
-                reg_name,
-                bool(remove_batch_dim),
-                slice_tuple,
-                device if device is not None else None,
+        engine = self.monitoring_engine
+        if engine is None:
+            return
+        native_cfg = _NativeHookConfig(
+            engine=engine,
+            remove_batch_dim=bool(remove_batch_dim),
+            pos_slice=pos_slice,
+            device=device if device is not None else None,
+        )
+        for _, reg_hp in self.hook_dict.items():
+            reg_hp.add_hook(
+                None,
+                dir="fwd",
+                is_permanent=True,
+                native_config=native_cfg,
             )
-
-            def gated_callback(
-                tensor: Tensor,
-                *,
-                hook: HookPoint,
-                _cb=callback,
-                _root=self,
-            ):
-                try:
-                    engine = getattr(_root, "monitoring_engine", None)
-                    if engine is not None and not engine.is_capture_enabled():
-                        return None
-                except Exception:
-                    pass
-                return _cb(tensor)
-
-            reg_hp.add_hook(gated_callback, dir="fwd", is_permanent=True)
         self._native_callbacks_registered = True
 
     def get_caching_hooks(
@@ -1214,39 +1246,22 @@ class HookedRootModule(nn.Module):
         if native_callback_active and native_backend is not None:
             # Permanent registration path: register global callback once for all hook points
             if not self._native_callbacks_registered:
-                try:
-                    from monitoring.task import _encode_slice_native  # type: ignore
-                except Exception:
-                    _encode_slice_native = None  # type: ignore
-                # Register for all known hook points once
-                for reg_name, reg_hp in self.hook_dict.items():
-                    slice_tuple = _encode_slice_native(pos_slice) if _encode_slice_native is not None else (0,)
-                    with _nvtx_range(f"TL::BuildCallback[{reg_name}]"):
-                        callback = native_backend.create_global_hook_callback_sig(
-                            reg_name,
-                            bool(remove_batch_dim),
-                            slice_tuple,
-                            device if device is not None else None,
+                engine = self.monitoring_engine
+                if engine is not None:
+                    native_cfg = _NativeHookConfig(
+                        engine=engine,
+                        remove_batch_dim=bool(remove_batch_dim),
+                        pos_slice=pos_slice,
+                        device=device if device is not None else None,
+                    )
+                    for _, reg_hp in self.hook_dict.items():
+                        reg_hp.add_hook(
+                            None,
+                            dir="fwd",
+                            is_permanent=True,
+                            native_config=native_cfg,
                         )
-
-                    def gated_callback(
-                        tensor: Tensor,
-                        *,
-                        hook: HookPoint,
-                        _cb=callback,
-                        _root=self,
-                    ):
-                        try:
-                            engine = getattr(_root, "monitoring_engine", None)
-                            if engine is not None and not engine.is_capture_enabled():
-                                return None
-                        except Exception:
-                            pass
-                        return _cb(tensor)
-
-                    # Register as permanent so ResetHooks won't remove them
-                    reg_hp.add_hook(gated_callback, dir="fwd", is_permanent=True)
-                self._native_callbacks_registered = True
+                    self._native_callbacks_registered = True
             # No per-step hook registration needed in global native callback mode
             return cache, fwd_hooks, bwd_hooks
 
