@@ -310,10 +310,12 @@ class HookPoint(nn.Module):
         cfg = self._monitor_cfg
         if cfg is not None:
             engine, ticket, gate_name, cache_name = cfg
-            try:
-                engine.monitor_inline_hook(ticket, gate_name, cache_name, x)
-            except Exception:
-                pass
+            label = f"TL::InlineHook[{gate_name}]"
+            with _nvtx_range(label):
+                try:
+                    engine.monitor_inline_hook(ticket, gate_name, cache_name, x)
+                except Exception:
+                    pass
         return x
 
     def layer(self):
