@@ -23,7 +23,7 @@ from torch import Tensor
 from transformer_lens.utils import Slice, SliceInput
 
 try:
-    from monitoring import MonitoringEngine
+    from monitoring import MonitoringEngine, monitor_native
     from monitoring.task import MonitoringTask
 except ModuleNotFoundError:  # pragma: no cover - fallback when repo root not on sys.path
     import sys
@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when repo root not on
     repo_root = Path(__file__).resolve().parents[5]
     if str(repo_root) not in sys.path:
         sys.path.append(str(repo_root))
-    from monitoring import MonitoringEngine
+    from monitoring import MonitoringEngine, monitor_native
     from monitoring.task import MonitoringTask
 
 try:
@@ -179,7 +179,7 @@ class HookPoint(nn.Module):
         self.fwd_hooks: list[LensHandle] = []
         self.bwd_hooks: list[LensHandle] = []
         self.ctx = {}
-        self._monitor_cfg: Optional[tuple[Any, Any, str, str]] = None
+        self._monitor_handle: Optional[Any] = None
 
         # A variable giving the hook's name (from the perspective of the root
         # module) - this is set by the root module at setup.
@@ -307,15 +307,14 @@ class HookPoint(nn.Module):
         self.ctx = {}
 
     def forward(self, x: Tensor) -> Tensor:
-        cfg = self._monitor_cfg
-        if cfg is not None:
-            engine, ticket, gate_name, cache_name = cfg
-            label = f"TL::InlineHook[{gate_name}]"
+        handle = self._monitor_handle
+        if handle is not None:
+            label = f"TL::InlineHook[{self.name or 'unnamed'}]"
             with _nvtx_range(label):
                 try:
-                    engine.monitor_inline_hook(ticket, gate_name, cache_name, x)
+                    monitor_native.monitor_activation(x, handle)
                 except Exception:
-                    pass
+                    self._monitor_handle = None
         return x
 
     def layer(self):
@@ -815,7 +814,7 @@ class HookedRootModule(nn.Module):
 
         pos_slice = Slice.unwrap(pos_slice)
         for hp in self.hook_dict.values():
-            hp._monitor_cfg = None
+            hp._monitor_handle = None
         self._inline_monitoring_enabled = False
 
         native_backend = getattr(engine, "_native_backend", None)
@@ -887,13 +886,14 @@ class HookedRootModule(nn.Module):
         if inline_allowed and engine is not None:
             try:
                 for reg_name, reg_hp in self.hook_dict.items():
-                    ticket = engine.create_inline_hook_ticket(
+                    handle = engine.create_inline_monitor_handle(
                         reg_name,
+                        cache_name=reg_name,
                         remove_batch_dim=bool(remove_batch_dim),
                         pos_slice=pos_slice,
                         device=device if device is not None else None,
                     )
-                    reg_hp._monitor_cfg = (engine, ticket, reg_name, reg_name)
+                    reg_hp._monitor_handle = handle
                 self._inline_monitoring_enabled = True
                 self._native_callbacks_registered = True
                 return
