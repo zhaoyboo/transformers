@@ -179,6 +179,7 @@ class HookPoint(nn.Module):
         self.fwd_hooks: list[LensHandle] = []
         self.bwd_hooks: list[LensHandle] = []
         self.ctx = {}
+        self._monitor_cfg: Optional[tuple[Any, Any, str, str]] = None
 
         # A variable giving the hook's name (from the perspective of the root
         # module) - this is set by the root module at setup.
@@ -306,6 +307,13 @@ class HookPoint(nn.Module):
         self.ctx = {}
 
     def forward(self, x: Tensor) -> Tensor:
+        cfg = self._monitor_cfg
+        if cfg is not None:
+            engine, ticket, gate_name, cache_name = cfg
+            try:
+                engine.monitor_inline_hook(ticket, gate_name, cache_name, x)
+            except Exception:
+                pass
         return x
 
     def layer(self):
@@ -348,6 +356,7 @@ class HookedRootModule(nn.Module):
         self.is_caching = False
         self.context_level = 0
         self.monitoring_engine: Optional[MonitoringEngine] = None
+        self._inline_monitoring_enabled: bool = False
         # Native global callback registration state
         self._native_callbacks_registered: bool = False
         self._native_handles: dict[str, hooks.RemovableHandle] = {}
@@ -803,6 +812,9 @@ class HookedRootModule(nn.Module):
             return
 
         pos_slice = Slice.unwrap(pos_slice)
+        for hp in self.hook_dict.values():
+            hp._monitor_cfg = None
+        self._inline_monitoring_enabled = False
 
         native_backend = getattr(engine, "_native_backend", None)
         native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
@@ -868,6 +880,23 @@ class HookedRootModule(nn.Module):
 
         if self._native_callbacks_registered:
             return
+
+        inline_allowed = bool(int(os.environ.get("MON_INLINE_HOOK", "1")))
+        if inline_allowed and engine is not None:
+            try:
+                for reg_name, reg_hp in self.hook_dict.items():
+                    ticket = engine.create_inline_hook_ticket(
+                        reg_name,
+                        remove_batch_dim=bool(remove_batch_dim),
+                        pos_slice=pos_slice,
+                        device=device if device is not None else None,
+                    )
+                    reg_hp._monitor_cfg = (engine, ticket, reg_name, reg_name)
+                self._inline_monitoring_enabled = True
+                self._native_callbacks_registered = True
+                return
+            except Exception:
+                self._inline_monitoring_enabled = False
 
         engine = self.monitoring_engine
         if engine is None:
@@ -1211,6 +1240,9 @@ class HookedRootModule(nn.Module):
 
         fwd_hooks = []
         bwd_hooks = []
+
+        if self._inline_monitoring_enabled:
+            return cache, fwd_hooks, bwd_hooks
 
         # Precompute enabled names and inform native backend (for global callbacks).
         # If enabled names are precomputed, skip per-step recomputation.
