@@ -307,14 +307,6 @@ class HookPoint(nn.Module):
         self.ctx = {}
 
     def forward(self, x: Tensor) -> Tensor:
-        handle = self._monitor_handle
-        if handle is not None:
-            label = f"TL::InlineHook[{self.name or 'unnamed'}]"
-            with _nvtx_range(label):
-                try:
-                    monitor_native.monitor_activation(x, handle)
-                except Exception:
-                    self._monitor_handle = None
         return x
 
     def layer(self):
@@ -362,6 +354,31 @@ class HookedRootModule(nn.Module):
         self._native_callbacks_registered: bool = False
         self._native_handles: dict[str, hooks.RemovableHandle] = {}
         self._native_enabled_hooks_key: Optional[int] = None
+        self._inline_hook_bridge_callable: Optional[Callable[[HookPoint, Tensor], Tensor]] = None
+
+    def _call_inline_hook(self, hook_point: HookPoint, tensor: Tensor) -> Tensor:
+        handle = getattr(hook_point, "_monitor_handle", None)
+        has_python_hooks = bool(hook_point.fwd_hooks)
+        if has_python_hooks:
+            tensor = hook_point(tensor)
+        if handle is None:
+            return tensor
+        label = f"TL::InlineHook[{hook_point.name or 'unnamed'}]"
+        with _nvtx_range(label):
+            try:
+                monitor_native.monitor_activation(tensor, handle)
+            except Exception:
+                hook_point._monitor_handle = None
+                return tensor
+        return tensor
+
+    def _set_inline_hook_bridge(self, bridge: Optional[Callable[[HookPoint, Tensor], Tensor]]) -> None:
+        if self._inline_hook_bridge_callable is bridge:
+            return
+        self._inline_hook_bridge_callable = bridge
+        for module in self.modules():
+            if hasattr(module, "_inline_hook_bridge"):
+                module._inline_hook_bridge = bridge
 
     def setup(self):
         """
@@ -816,6 +833,7 @@ class HookedRootModule(nn.Module):
         for hp in self.hook_dict.values():
             hp._monitor_handle = None
         self._inline_monitoring_enabled = False
+        self._set_inline_hook_bridge(None)
 
         native_backend = getattr(engine, "_native_backend", None)
         native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
@@ -896,6 +914,7 @@ class HookedRootModule(nn.Module):
                     reg_hp._monitor_handle = handle
                 self._inline_monitoring_enabled = True
                 self._native_callbacks_registered = True
+                self._set_inline_hook_bridge(self._call_inline_hook)
                 return
             except Exception:
                 self._inline_monitoring_enabled = False
