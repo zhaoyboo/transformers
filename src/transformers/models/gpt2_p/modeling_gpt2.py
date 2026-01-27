@@ -51,18 +51,6 @@ from .hook_points import HookPoint, HookedRootModule
 logger = logging.get_logger(__name__)
 
 
-class _HookBridgeMixin:
-    """Mixin providing a bridge to native monitoring hooks."""
-
-    _inline_hook_bridge: Optional[Callable] = None
-
-    def _apply_hook_bridge(self, hook_point: HookPoint, tensor: torch.Tensor) -> torch.Tensor:
-        bridge = getattr(self, "_inline_hook_bridge", None)
-        if bridge is not None:
-            return bridge(hook_point, tensor)
-        return hook_point(tensor)
-
-
 def eager_attention_forward(module, query, key, value, attention_mask, **kwargs):
     attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
@@ -91,18 +79,12 @@ def eager_attention_forward(module, query, key, value, attention_mask, **kwargs)
         attn_weights = attn_weights + causal_mask
 
     if hasattr(module, "hook_attn_scores"):
-        if hasattr(module, "_apply_hook_bridge"):
-            attn_weights = module._apply_hook_bridge(module.hook_attn_scores, attn_weights)
-        else:
-            attn_weights = module.hook_attn_scores(attn_weights)
+        attn_weights = module.hook_attn_scores.monitor_activation(attn_weights)
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
     if hasattr(module, "hook_pattern"):
-        if hasattr(module, "_apply_hook_bridge"):
-            attn_weights = module._apply_hook_bridge(module.hook_pattern, attn_weights)
-        else:
-            attn_weights = module.hook_pattern(attn_weights)
+        attn_weights = module.hook_pattern.monitor_activation(attn_weights)
 
     # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
     attn_weights = attn_weights.type(value.dtype)
@@ -114,7 +96,7 @@ def eager_attention_forward(module, query, key, value, attention_mask, **kwargs)
     return attn_output, attn_weights
 
 
-class GPT2Attention(_HookBridgeMixin, nn.Module):
+class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
         self.config = config
@@ -274,28 +256,28 @@ class GPT2Attention(_HookBridgeMixin, nn.Module):
                 shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
                 key_states = key_states.view(shape_kv)
                 # New hook place with shape of [batch_size, seq_len, n_head, head_dim]
-                key_states = self._apply_hook_bridge(self.hook_k, key_states)
+                key_states = self.hook_k.monitor_activation(key_states)
                 key_states = key_states.transpose(1, 2)
                 value_states = value_states.view(shape_kv)
                 # New hook place with shape of [batch_size, seq_len, n_head, head_dim]
-                value_states = self._apply_hook_bridge(self.hook_v, value_states)
+                value_states = self.hook_v.monitor_activation(value_states)
                 value_states = value_states.transpose(1, 2)
         else:
             query_states, key_states, value_states = self.c_attn(hidden_states).split(self.split_size, dim=2)
             shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
             key_states = key_states.view(shape_kv)
             # New hook place with shape of [batch_size, seq_len, n_head, head_dim]
-            key_states = self._apply_hook_bridge(self.hook_k, key_states)
+            key_states = self.hook_k.monitor_activation(key_states)
             key_states = key_states.transpose(1, 2)
             value_states = value_states.view(shape_kv)
             # New hook place with shape of [batch_size, seq_len, n_head, head_dim]
-            value_states = self._apply_hook_bridge(self.hook_v, value_states)
+            value_states = self.hook_v.monitor_activation(value_states)
             value_states = value_states.transpose(1, 2)
 
         shape_q = (*query_states.shape[:-1], -1, self.head_dim)
         query_states = query_states.view(shape_q)
         # New hook place with shape of [batch_size, seq_len, n_head, head_dim]
-        query_states = self._apply_hook_bridge(self.hook_q, query_states)
+        query_states = self.hook_q.monitor_activation(query_states)
         query_states = query_states.transpose(1, 2)
 
         # Apply hooks on the per-step Q/K/V before any cache update so hooks capture only
@@ -344,13 +326,13 @@ class GPT2Attention(_HookBridgeMixin, nn.Module):
             )
 
         if not using_eager and hasattr(self, "hook_pattern") and attn_weights is not None:
-            attn_weights = self._apply_hook_bridge(self.hook_pattern, attn_weights)
+            attn_weights = self.hook_pattern.monitor_activation(attn_weights)
 
-        attn_output = self._apply_hook_bridge(self.hook_z, attn_output)
+        attn_output = self.hook_z.monitor_activation(attn_output)
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
-        attn_output = self._apply_hook_bridge(self.hook_result, attn_output)
+        attn_output = self.hook_result.monitor_activation(attn_output)
 
         return attn_output, attn_weights
 
@@ -372,7 +354,7 @@ class GPT2MLP(nn.Module):
         return hidden_states
 
 
-class GPT2Block(_HookBridgeMixin, GradientCheckpointingLayer):
+class GPT2Block(GradientCheckpointingLayer):
     def __init__(self, config, layer_idx=None):
         super().__init__()
         hidden_size = config.hidden_size
@@ -413,8 +395,8 @@ class GPT2Block(_HookBridgeMixin, GradientCheckpointingLayer):
     ) -> Union[tuple[torch.Tensor], Optional[tuple[torch.Tensor, tuple[torch.FloatTensor, ...]]]]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        hidden_states = self._apply_hook_bridge(self.hook_ln1, hidden_states)
-        attn_input = self._apply_hook_bridge(self.hook_resid_pre, hidden_states)
+        hidden_states = self.hook_ln1.monitor_activation(hidden_states)
+        attn_input = self.hook_resid_pre.monitor_activation(hidden_states)
         attn_output, self_attn_weights = self.attn(
             attn_input,
             past_key_values=past_key_values,
@@ -425,9 +407,9 @@ class GPT2Block(_HookBridgeMixin, GradientCheckpointingLayer):
             **kwargs,
         )
         # residual connection
-        attn_output = self._apply_hook_bridge(self.hook_attn_out, attn_output)
+        attn_output = self.hook_attn_out.monitor_activation(attn_output)
         hidden_states = attn_output + residual
-        hidden_states = self._apply_hook_bridge(self.hook_resid_mid, hidden_states)
+        hidden_states = self.hook_resid_mid.monitor_activation(hidden_states)
 
         if encoder_hidden_states is not None:
             # add one self-attention block for cross-attention
@@ -451,13 +433,13 @@ class GPT2Block(_HookBridgeMixin, GradientCheckpointingLayer):
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-        hidden_states = self._apply_hook_bridge(self.hook_ln2, hidden_states)
-        mlp_input = self._apply_hook_bridge(self.hook_mlp_in, hidden_states)
+        hidden_states = self.hook_ln2.monitor_activation(hidden_states)
+        mlp_input = self.hook_mlp_in.monitor_activation(hidden_states)
         feed_forward_hidden_states = self.mlp(mlp_input)
-        feed_forward_hidden_states = self._apply_hook_bridge(self.hook_mlp_out, feed_forward_hidden_states)
+        feed_forward_hidden_states = self.hook_mlp_out.monitor_activation(feed_forward_hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
-        hidden_states = self._apply_hook_bridge(self.hook_resid_post, hidden_states)
+        hidden_states = self.hook_resid_post.monitor_activation(hidden_states)
 
         outputs = (hidden_states,)
         if output_attentions:
@@ -643,7 +625,7 @@ class GPT2DoubleHeadsModelOutput(ModelOutput):
 
 
 @auto_docstring
-class GPT2Model(_HookBridgeMixin, GPT2PreTrainedModel):
+class GPT2Model(GPT2PreTrainedModel):
     _supports_param_buffer_assignment = False
 
     def __init__(self, config):
@@ -765,7 +747,7 @@ class GPT2Model(_HookBridgeMixin, GPT2PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        inputs_embeds = self._apply_hook_bridge(self.hook_embed, inputs_embeds)
+        inputs_embeds = self.hook_embed.monitor_activation(inputs_embeds)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -776,7 +758,7 @@ class GPT2Model(_HookBridgeMixin, GPT2PreTrainedModel):
             position_ids = cache_position.unsqueeze(0)
 
         position_embeds = self.wpe(position_ids)
-        position_embeds = self._apply_hook_bridge(self.hook_pos_embed, position_embeds)
+        position_embeds = self.hook_pos_embed.monitor_activation(position_embeds)
         hidden_states = inputs_embeds + position_embeds.to(inputs_embeds.device)
 
         # Attention mask.
@@ -845,7 +827,7 @@ class GPT2Model(_HookBridgeMixin, GPT2PreTrainedModel):
                     all_cross_attentions = all_cross_attentions + (outputs[2],)
 
         hidden_states = self.ln_f(hidden_states)
-        hidden_states = self._apply_hook_bridge(self.hook_final_ln, hidden_states)
+        hidden_states = self.hook_final_ln.monitor_activation(hidden_states)
 
         hidden_states = hidden_states.view(output_shape)
         # Add last hidden state
