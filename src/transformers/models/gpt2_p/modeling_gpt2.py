@@ -750,6 +750,8 @@ class GPT2Model(GPT2PreTrainedModel):
         device = input_ids.device if input_ids is not None else inputs_embeds.device
         _mon = getattr(self, "_mon_buf", None)
         _off = getattr(self, "_mon_frame_offset", 0) if _mon is not None else 0
+        _bb = getattr(self, "_mon_barrier_base", -1)
+        _bl = getattr(self, "_mon_barrier_layers", None)
 
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
@@ -837,6 +839,10 @@ class GPT2Model(GPT2PreTrainedModel):
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
         for i, block in enumerate(self.h):
+            # D2H barrier: ensure previous cycle's D2H for this layer group is complete
+            if _bb >= 0 and _bl is not None and i in _bl:
+                torch.ops.graphmonitor_ops.wait_d2h(_mon, _bb + _bl[i])
+
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
