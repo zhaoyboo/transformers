@@ -88,9 +88,8 @@ def eager_attention_forward(module, query, key, value, attention_mask, **kwargs)
         causal_mask = attention_mask[:, :, :, : key.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
+    _off = getattr(module, "_mon_frame_offset", 0)
     _mon = getattr(module, "_mon_buf", None)
-    if _mon is not None:
-        _off = getattr(module, "_mon_frame_offset", 0)
     if _mon is not None and hasattr(module, "_mon_slot_hook_attn_scores"):
         _mon_record(attn_weights, _mon, module._mon_slot_hook_attn_scores + _off)
 
@@ -239,8 +238,8 @@ class GPT2Attention(nn.Module):
         output_attentions: Optional[bool] = False,
         **kwargs,
     ) -> tuple[Union[torch.Tensor, tuple[torch.Tensor]], ...]:
+        _off = getattr(self, "_mon_frame_offset", 0)
         _mon = getattr(self, "_mon_buf", None)
-        _off = getattr(self, "_mon_frame_offset", 0) if _mon is not None else 0
         is_cross_attention = encoder_hidden_states is not None
         if past_key_values is not None:
             if isinstance(past_key_values, EncoderDecoderCache):
@@ -410,8 +409,8 @@ class GPT2Block(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         **kwargs,
     ) -> Union[tuple[torch.Tensor], Optional[tuple[torch.Tensor, tuple[torch.FloatTensor, ...]]]]:
+        _off = getattr(self, "_mon_frame_offset", 0)
         _mon = getattr(self, "_mon_buf", None)
-        _off = getattr(self, "_mon_frame_offset", 0) if _mon is not None else 0
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         if _mon is not None:
@@ -748,8 +747,8 @@ class GPT2Model(GPT2PreTrainedModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         device = input_ids.device if input_ids is not None else inputs_embeds.device
+        _off = getattr(self, "_mon_frame_offset", 0)
         _mon = getattr(self, "_mon_buf", None)
-        _off = getattr(self, "_mon_frame_offset", 0) if _mon is not None else 0
 
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
