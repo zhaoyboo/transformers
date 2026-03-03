@@ -418,12 +418,12 @@ class GPT2Block(GradientCheckpointingLayer):
         _off = getattr(self, "_mon_frame_offset", 0)
         _mon = getattr(self, "_mon_buf", None)
         residual = hidden_states
+        if _mon is not None:
+            _mon_record(hidden_states, _mon, self._mon_slot_hook_resid_pre + _off, _mon_anchors)
         hidden_states = self.ln_1(hidden_states)
         if _mon is not None:
             _mon_record(hidden_states, _mon, self._mon_slot_hook_ln1 + _off, _mon_anchors)
         attn_input = hidden_states
-        if _mon is not None:
-            _mon_record(attn_input, _mon, self._mon_slot_hook_resid_pre + _off, _mon_anchors)
         attn_output, self_attn_weights = self.attn(
             attn_input,
             past_key_values=past_key_values,
@@ -1452,6 +1452,109 @@ class HookedGPT2Model(GPT2Model, HookedRootModule):
     def __init__(self, config):
         GPT2Model.__init__(self, config)
         self.setup()
+        self._normalize_hook_names()
+
+    def _normalize_hook_names(self) -> None:
+        """Drop legacy aliases and normalize hook names for DB usage."""
+        normalized: dict[str, HookPoint] = {}
+        for name, hook_point in list(self.hook_dict.items()):
+            if name.startswith("transformer."):
+                name = name[len("transformer."):]
+            if name.startswith("h."):
+                continue
+            hook_point.name = name
+            normalized[name] = hook_point
+        self.hook_dict = normalized
+
+
+class HookedGPT2LMHeadModel(GPT2LMHeadModel, HookedRootModule):
+    """GPT-2 LM head model with TransformerLens-style hooks + token_ids/final_logits."""
+
+    def __init__(self, config):
+        GPT2LMHeadModel.__init__(self, config)
+        self.token_ids = HookPoint()
+        self.final_logits = HookPoint()
+        self.setup()
+        self._normalize_hook_names()
+
+    def _normalize_hook_names(self) -> None:
+        """Drop legacy aliases and normalize hook names for DB usage."""
+        normalized: dict[str, HookPoint] = {}
+        for name, hook_point in list(self.hook_dict.items()):
+            if name.startswith("transformer."):
+                name = name[len("transformer."):]
+            if name.startswith("h."):
+                continue
+            hook_point.name = name
+            normalized[name] = hook_point
+        self.hook_dict = normalized
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ) -> Union[tuple, CausalLMOutputWithCrossAttentions]:
+        if input_ids is not None:
+            input_ids = self.token_ids(input_ids)
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        transformer_outputs = self.transformer(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_states = transformer_outputs[0]
+
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.final_logits(logits)
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits,
+                labels,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
+
+        if not return_dict:
+            output = (logits,) + transformer_outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return CausalLMOutputWithCrossAttentions(
+            loss=loss,
+            logits=logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+            cross_attentions=transformer_outputs.cross_attentions,
+        )
 
 
 __all__ = [
@@ -1460,6 +1563,7 @@ __all__ = [
     "GPT2ForSequenceClassification",
     "GPT2ForTokenClassification",
     "HookedGPT2Model",
+    "HookedGPT2LMHeadModel",
     "GPT2LMHeadModel",
     "GPT2Model",
     "GPT2PreTrainedModel",
