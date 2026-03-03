@@ -187,6 +187,10 @@ class GPT2Config(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
+        # Default to eager attention so all HookPoints (including hook_attn_scores
+        # and hook_pattern) produce tensors.  sdpa fuses these inside the kernel.
+        kwargs.setdefault("attn_implementation", "eager")
+
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
 

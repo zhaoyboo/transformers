@@ -93,13 +93,17 @@ def eager_attention_forward(module, query, key, value, attention_mask, _mon_anch
 
     _off = getattr(module, "_mon_frame_offset", 0)
     _mon = getattr(module, "_mon_buf", None)
-    if _mon is not None and hasattr(module, "_mon_slot_hook_attn_scores"):
+    if _mon is not None:
         _mon_record(attn_weights, _mon, module._mon_slot_hook_attn_scores + _off, _mon_anchors)
+    else:
+        attn_weights = module.hook_attn_scores.monitor_activation(attn_weights)
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-    if _mon is not None and hasattr(module, "_mon_slot_hook_pattern"):
+    if _mon is not None:
         _mon_record(attn_weights, _mon, module._mon_slot_hook_pattern + _off, _mon_anchors)
+    else:
+        attn_weights = module.hook_pattern.monitor_activation(attn_weights)
 
     # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
     attn_weights = attn_weights.type(value.dtype)
@@ -275,10 +279,14 @@ class GPT2Attention(nn.Module):
                 key_states = key_states.view(shape_kv)
                 if _mon is not None:
                     _mon_record(key_states, _mon, self._mon_slot_hook_k + _off, _mon_anchors)
+                else:
+                    key_states = self.hook_k.monitor_activation(key_states)
                 key_states = key_states.transpose(1, 2)
                 value_states = value_states.view(shape_kv)
                 if _mon is not None:
                     _mon_record(value_states, _mon, self._mon_slot_hook_v + _off, _mon_anchors)
+                else:
+                    value_states = self.hook_v.monitor_activation(value_states)
                 value_states = value_states.transpose(1, 2)
         else:
             query_states, key_states, value_states = self.c_attn(hidden_states).split(self.split_size, dim=2)
@@ -286,16 +294,22 @@ class GPT2Attention(nn.Module):
             key_states = key_states.view(shape_kv)
             if _mon is not None:
                 _mon_record(key_states, _mon, self._mon_slot_hook_k + _off, _mon_anchors)
+            else:
+                key_states = self.hook_k.monitor_activation(key_states)
             key_states = key_states.transpose(1, 2)
             value_states = value_states.view(shape_kv)
             if _mon is not None:
                 _mon_record(value_states, _mon, self._mon_slot_hook_v + _off, _mon_anchors)
+            else:
+                value_states = self.hook_v.monitor_activation(value_states)
             value_states = value_states.transpose(1, 2)
 
         shape_q = (*query_states.shape[:-1], -1, self.head_dim)
         query_states = query_states.view(shape_q)
         if _mon is not None:
             _mon_record(query_states, _mon, self._mon_slot_hook_q + _off, _mon_anchors)
+        else:
+            query_states = self.hook_q.monitor_activation(query_states)
         query_states = query_states.transpose(1, 2)
 
         # Apply hooks on the per-step Q/K/V before any cache update so hooks capture only
@@ -303,8 +317,8 @@ class GPT2Attention(nn.Module):
         # Below is the old hook place with shape of [batch_size, n_head, seq_len, head_dim],
         # Switch to match TransformerLens
         # query_states = self.hook_q(query_states)
-        # key_states = self.hook_k(key_states)
-        # value_states = self.hook_v(value_states)
+        # key_states = self.hook_k.monitor_activation(key_states)
+        # value_states = self.hook_v.monitor_activation(value_states)
 
         if (past_key_values is not None and not is_cross_attention) or (
             past_key_values is not None and is_cross_attention and not is_updated
@@ -344,16 +358,23 @@ class GPT2Attention(nn.Module):
                 **kwargs,
             )
 
-        if not using_eager and _mon is not None and attn_weights is not None:
-            _mon_record(attn_weights, _mon, self._mon_slot_hook_pattern + _off, _mon_anchors)
+        if not using_eager and attn_weights is not None:
+            if _mon is not None:
+                _mon_record(attn_weights, _mon, self._mon_slot_hook_pattern + _off, _mon_anchors)
+            else:
+                attn_weights = self.hook_pattern.monitor_activation(attn_weights)
 
         if _mon is not None:
             _mon_record(attn_output, _mon, self._mon_slot_hook_z + _off, _mon_anchors)
+        else:
+            attn_output = self.hook_z.monitor_activation(attn_output)
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
         if _mon is not None:
             _mon_record(attn_output, _mon, self._mon_slot_hook_result + _off, _mon_anchors)
+        else:
+            attn_output = self.hook_result.monitor_activation(attn_output)
 
         return attn_output, attn_weights
 
@@ -420,9 +441,13 @@ class GPT2Block(GradientCheckpointingLayer):
         residual = hidden_states
         if _mon is not None:
             _mon_record(hidden_states, _mon, self._mon_slot_hook_resid_pre + _off, _mon_anchors)
+        else:
+            hidden_states = self.hook_resid_pre.monitor_activation(hidden_states)
         hidden_states = self.ln_1(hidden_states)
         if _mon is not None:
             _mon_record(hidden_states, _mon, self._mon_slot_hook_ln1 + _off, _mon_anchors)
+        else:
+            hidden_states = self.hook_ln1.monitor_activation(hidden_states)
         attn_input = hidden_states
         attn_output, self_attn_weights = self.attn(
             attn_input,
@@ -437,9 +462,13 @@ class GPT2Block(GradientCheckpointingLayer):
         # residual connection
         if _mon is not None:
             _mon_record(attn_output, _mon, self._mon_slot_hook_attn_out + _off, _mon_anchors)
+        else:
+            attn_output = self.hook_attn_out.monitor_activation(attn_output)
         hidden_states = attn_output + residual
         if _mon is not None:
             _mon_record(hidden_states, _mon, self._mon_slot_hook_resid_mid + _off, _mon_anchors)
+        else:
+            hidden_states = self.hook_resid_mid.monitor_activation(hidden_states)
 
         if encoder_hidden_states is not None:
             # add one self-attention block for cross-attention
@@ -465,16 +494,24 @@ class GPT2Block(GradientCheckpointingLayer):
         hidden_states = self.ln_2(hidden_states)
         if _mon is not None:
             _mon_record(hidden_states, _mon, self._mon_slot_hook_ln2 + _off, _mon_anchors)
+        else:
+            hidden_states = self.hook_ln2.monitor_activation(hidden_states)
         mlp_input = hidden_states
         if _mon is not None:
             _mon_record(mlp_input, _mon, self._mon_slot_hook_mlp_in + _off, _mon_anchors)
+        else:
+            mlp_input = self.hook_mlp_in.monitor_activation(mlp_input)
         feed_forward_hidden_states = self.mlp(mlp_input)
         if _mon is not None:
             _mon_record(feed_forward_hidden_states, _mon, self._mon_slot_hook_mlp_out + _off, _mon_anchors)
+        else:
+            feed_forward_hidden_states = self.hook_mlp_out.monitor_activation(feed_forward_hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
         if _mon is not None:
             _mon_record(hidden_states, _mon, self._mon_slot_hook_resid_post + _off, _mon_anchors)
+        else:
+            hidden_states = self.hook_resid_post.monitor_activation(hidden_states)
 
         outputs = (hidden_states,)
         if output_attentions:
@@ -787,6 +824,8 @@ class GPT2Model(GPT2PreTrainedModel):
             inputs_embeds = self.wte(input_ids)
         if _mon is not None:
             _mon_record(inputs_embeds, _mon, self._mon_slot_hook_embed + _off, _anch)
+        else:
+            inputs_embeds = self.hook_embed.monitor_activation(inputs_embeds)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -799,6 +838,8 @@ class GPT2Model(GPT2PreTrainedModel):
         position_embeds = self.wpe(position_ids)
         if _mon is not None:
             _mon_record(position_embeds, _mon, self._mon_slot_hook_pos_embed + _off, _anch)
+        else:
+            position_embeds = self.hook_pos_embed.monitor_activation(position_embeds)
         hidden_states = inputs_embeds + position_embeds.to(inputs_embeds.device)
 
         # Attention mask.
@@ -870,6 +911,8 @@ class GPT2Model(GPT2PreTrainedModel):
         hidden_states = self.ln_f(hidden_states)
         if _mon is not None:
             _mon_record(hidden_states, _mon, self._mon_slot_hook_final_ln + _off, _anch)
+        else:
+            hidden_states = self.hook_final_ln.monitor_activation(hidden_states)
 
         if _anch:
             torch.ops.graphmonitor_ops.anchor(_mon, _anch)
@@ -1455,16 +1498,26 @@ class HookedGPT2Model(GPT2Model, HookedRootModule):
         self._normalize_hook_names()
 
     def _normalize_hook_names(self) -> None:
-        """Drop legacy aliases and normalize hook names for DB usage."""
-        normalized: dict[str, HookPoint] = {}
+        """Drop legacy aliases and normalize hook/mod names for DB usage."""
+        normalized_hooks: dict[str, HookPoint] = {}
+        normalized_mods: dict[str, nn.Module] = {}
         for name, hook_point in list(self.hook_dict.items()):
             if name.startswith("transformer."):
                 name = name[len("transformer."):]
             if name.startswith("h."):
                 continue
             hook_point.name = name
-            normalized[name] = hook_point
-        self.hook_dict = normalized
+            normalized_hooks[name] = hook_point
+            normalized_mods[name] = hook_point
+        # Also normalize non-HookPoint mod_dict entries
+        for old_name, mod in list(self.mod_dict.items()):
+            short = old_name[len("transformer."):] if old_name.startswith("transformer.") else old_name
+            if short.startswith("h."):
+                continue
+            if short not in normalized_mods:
+                normalized_mods[short] = mod
+        self.hook_dict = normalized_hooks
+        self.mod_dict = normalized_mods
 
 
 class HookedGPT2LMHeadModel(GPT2LMHeadModel, HookedRootModule):
@@ -1478,16 +1531,26 @@ class HookedGPT2LMHeadModel(GPT2LMHeadModel, HookedRootModule):
         self._normalize_hook_names()
 
     def _normalize_hook_names(self) -> None:
-        """Drop legacy aliases and normalize hook names for DB usage."""
-        normalized: dict[str, HookPoint] = {}
+        """Drop legacy aliases and normalize hook/mod names for DB usage."""
+        normalized_hooks: dict[str, HookPoint] = {}
+        normalized_mods: dict[str, nn.Module] = {}
         for name, hook_point in list(self.hook_dict.items()):
             if name.startswith("transformer."):
                 name = name[len("transformer."):]
             if name.startswith("h."):
                 continue
             hook_point.name = name
-            normalized[name] = hook_point
-        self.hook_dict = normalized
+            normalized_hooks[name] = hook_point
+            normalized_mods[name] = hook_point
+        # Also normalize non-HookPoint mod_dict entries
+        for old_name, mod in list(self.mod_dict.items()):
+            short = old_name[len("transformer."):] if old_name.startswith("transformer.") else old_name
+            if short.startswith("h."):
+                continue
+            if short not in normalized_mods:
+                normalized_mods[short] = mod
+        self.hook_dict = normalized_hooks
+        self.mod_dict = normalized_mods
 
     def forward(
         self,
