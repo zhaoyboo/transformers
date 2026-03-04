@@ -51,20 +51,7 @@ from .hook_points import HookPoint, HookedRootModule
 logger = logging.get_logger(__name__)
 
 
-def _mon_record(tensor: torch.Tensor, buf: torch.Tensor, slot_id: int, anchors=None):
-    """Record tensor metadata to GPU shadow buffer via torch custom ops.
-
-    Called directly in forward code — no HookPoint dispatch, no register_forward_hook.
-    record() has Meta dispatch so Dynamo traces it as a graph node.
-    Buffer reuse is prevented by a custom Inductor lowering that adds the
-    tensor to ``V.graph.never_reuse_buffers`` (see graph_ops.py).
-    """
-    torch.ops.graphmonitor_ops.record(tensor, buf, slot_id)
-    if anchors is not None:
-        anchors.append(tensor)
-
-
-def eager_attention_forward(module, query, key, value, attention_mask, _mon_anchors=None, **kwargs):
+def eager_attention_forward(module, query, key, value, attention_mask, **kwargs):
     attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
     if module.scale_attn_weights:
@@ -91,19 +78,11 @@ def eager_attention_forward(module, query, key, value, attention_mask, _mon_anch
         causal_mask = attention_mask[:, :, :, : key.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    _off = getattr(module, "_mon_frame_offset", 0)
-    _mon = getattr(module, "_mon_buf", None)
-    if _mon is not None:
-        _mon_record(attn_weights, _mon, module._mon_slot_hook_attn_scores + _off, _mon_anchors)
-    else:
-        attn_weights = module.hook_attn_scores.monitor_activation(attn_weights)
+    attn_weights = module.hook_attn_scores(attn_weights)
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-    if _mon is not None:
-        _mon_record(attn_weights, _mon, module._mon_slot_hook_pattern + _off, _mon_anchors)
-    else:
-        attn_weights = module.hook_pattern.monitor_activation(attn_weights)
+    attn_weights = module.hook_pattern(attn_weights)
 
     # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
     attn_weights = attn_weights.type(value.dtype)
@@ -243,11 +222,8 @@ class GPT2Attention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = False,
-        _mon_anchors=None,
         **kwargs,
     ) -> tuple[Union[torch.Tensor, tuple[torch.Tensor]], ...]:
-        _off = getattr(self, "_mon_frame_offset", 0)
-        _mon = getattr(self, "_mon_buf", None)
         is_cross_attention = encoder_hidden_states is not None
         if past_key_values is not None:
             if isinstance(past_key_values, EncoderDecoderCache):
@@ -277,39 +253,24 @@ class GPT2Attention(nn.Module):
                 key_states, value_states = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
                 shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
                 key_states = key_states.view(shape_kv)
-                if _mon is not None:
-                    _mon_record(key_states, _mon, self._mon_slot_hook_k + _off, _mon_anchors)
-                else:
-                    key_states = self.hook_k.monitor_activation(key_states)
+                key_states = self.hook_k(key_states)
                 key_states = key_states.transpose(1, 2)
                 value_states = value_states.view(shape_kv)
-                if _mon is not None:
-                    _mon_record(value_states, _mon, self._mon_slot_hook_v + _off, _mon_anchors)
-                else:
-                    value_states = self.hook_v.monitor_activation(value_states)
+                value_states = self.hook_v(value_states)
                 value_states = value_states.transpose(1, 2)
         else:
             query_states, key_states, value_states = self.c_attn(hidden_states).split(self.split_size, dim=2)
             shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
             key_states = key_states.view(shape_kv)
-            if _mon is not None:
-                _mon_record(key_states, _mon, self._mon_slot_hook_k + _off, _mon_anchors)
-            else:
-                key_states = self.hook_k.monitor_activation(key_states)
+            key_states = self.hook_k(key_states)
             key_states = key_states.transpose(1, 2)
             value_states = value_states.view(shape_kv)
-            if _mon is not None:
-                _mon_record(value_states, _mon, self._mon_slot_hook_v + _off, _mon_anchors)
-            else:
-                value_states = self.hook_v.monitor_activation(value_states)
+            value_states = self.hook_v(value_states)
             value_states = value_states.transpose(1, 2)
 
         shape_q = (*query_states.shape[:-1], -1, self.head_dim)
         query_states = query_states.view(shape_q)
-        if _mon is not None:
-            _mon_record(query_states, _mon, self._mon_slot_hook_q + _off, _mon_anchors)
-        else:
-            query_states = self.hook_q.monitor_activation(query_states)
+        query_states = self.hook_q(query_states)
         query_states = query_states.transpose(1, 2)
 
         # Apply hooks on the per-step Q/K/V before any cache update so hooks capture only
@@ -352,29 +313,19 @@ class GPT2Attention(nn.Module):
                 key_states,
                 value_states,
                 attention_mask,
-                _mon_anchors=_mon_anchors,
                 dropout=self.attn_dropout.p if self.training else 0.0,
                 is_causal=is_causal,
                 **kwargs,
             )
 
         if not using_eager and attn_weights is not None:
-            if _mon is not None:
-                _mon_record(attn_weights, _mon, self._mon_slot_hook_pattern + _off, _mon_anchors)
-            else:
-                attn_weights = self.hook_pattern.monitor_activation(attn_weights)
+            attn_weights = self.hook_pattern(attn_weights)
 
-        if _mon is not None:
-            _mon_record(attn_output, _mon, self._mon_slot_hook_z + _off, _mon_anchors)
-        else:
-            attn_output = self.hook_z.monitor_activation(attn_output)
+        attn_output = self.hook_z(attn_output)
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
-        if _mon is not None:
-            _mon_record(attn_output, _mon, self._mon_slot_hook_result + _off, _mon_anchors)
-        else:
-            attn_output = self.hook_result.monitor_activation(attn_output)
+        attn_output = self.hook_result(attn_output)
 
         return attn_output, attn_weights
 
@@ -433,21 +384,12 @@ class GPT2Block(GradientCheckpointingLayer):
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
-        _mon_anchors=None,
         **kwargs,
     ) -> Union[tuple[torch.Tensor], Optional[tuple[torch.Tensor, tuple[torch.FloatTensor, ...]]]]:
-        _off = getattr(self, "_mon_frame_offset", 0)
-        _mon = getattr(self, "_mon_buf", None)
         residual = hidden_states
-        if _mon is not None:
-            _mon_record(hidden_states, _mon, self._mon_slot_hook_resid_pre + _off, _mon_anchors)
-        else:
-            hidden_states = self.hook_resid_pre.monitor_activation(hidden_states)
+        hidden_states = self.hook_resid_pre(hidden_states)
         hidden_states = self.ln_1(hidden_states)
-        if _mon is not None:
-            _mon_record(hidden_states, _mon, self._mon_slot_hook_ln1 + _off, _mon_anchors)
-        else:
-            hidden_states = self.hook_ln1.monitor_activation(hidden_states)
+        hidden_states = self.hook_ln1(hidden_states)
         attn_input = hidden_states
         attn_output, self_attn_weights = self.attn(
             attn_input,
@@ -456,19 +398,12 @@ class GPT2Block(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            _mon_anchors=_mon_anchors,
             **kwargs,
         )
         # residual connection
-        if _mon is not None:
-            _mon_record(attn_output, _mon, self._mon_slot_hook_attn_out + _off, _mon_anchors)
-        else:
-            attn_output = self.hook_attn_out.monitor_activation(attn_output)
+        attn_output = self.hook_attn_out(attn_output)
         hidden_states = attn_output + residual
-        if _mon is not None:
-            _mon_record(hidden_states, _mon, self._mon_slot_hook_resid_mid + _off, _mon_anchors)
-        else:
-            hidden_states = self.hook_resid_mid.monitor_activation(hidden_states)
+        hidden_states = self.hook_resid_mid(hidden_states)
 
         if encoder_hidden_states is not None:
             # add one self-attention block for cross-attention
@@ -492,26 +427,14 @@ class GPT2Block(GradientCheckpointingLayer):
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-        if _mon is not None:
-            _mon_record(hidden_states, _mon, self._mon_slot_hook_ln2 + _off, _mon_anchors)
-        else:
-            hidden_states = self.hook_ln2.monitor_activation(hidden_states)
+        hidden_states = self.hook_ln2(hidden_states)
         mlp_input = hidden_states
-        if _mon is not None:
-            _mon_record(mlp_input, _mon, self._mon_slot_hook_mlp_in + _off, _mon_anchors)
-        else:
-            mlp_input = self.hook_mlp_in.monitor_activation(mlp_input)
+        mlp_input = self.hook_mlp_in(mlp_input)
         feed_forward_hidden_states = self.mlp(mlp_input)
-        if _mon is not None:
-            _mon_record(feed_forward_hidden_states, _mon, self._mon_slot_hook_mlp_out + _off, _mon_anchors)
-        else:
-            feed_forward_hidden_states = self.hook_mlp_out.monitor_activation(feed_forward_hidden_states)
+        feed_forward_hidden_states = self.hook_mlp_out(feed_forward_hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
-        if _mon is not None:
-            _mon_record(hidden_states, _mon, self._mon_slot_hook_resid_post + _off, _mon_anchors)
-        else:
-            hidden_states = self.hook_resid_post.monitor_activation(hidden_states)
+        hidden_states = self.hook_resid_post(hidden_states)
 
         outputs = (hidden_states,)
         if output_attentions:
@@ -791,9 +714,6 @@ class GPT2Model(GPT2PreTrainedModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         device = input_ids.device if input_ids is not None else inputs_embeds.device
-        _off = getattr(self, "_mon_frame_offset", 0)
-        _mon = getattr(self, "_mon_buf", None)
-        _anch = [] if _mon is not None else None
 
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
@@ -822,10 +742,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        if _mon is not None:
-            _mon_record(inputs_embeds, _mon, self._mon_slot_hook_embed + _off, _anch)
-        else:
-            inputs_embeds = self.hook_embed.monitor_activation(inputs_embeds)
+        inputs_embeds = self.hook_embed(inputs_embeds)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -836,10 +753,7 @@ class GPT2Model(GPT2PreTrainedModel):
             position_ids = cache_position.unsqueeze(0)
 
         position_embeds = self.wpe(position_ids)
-        if _mon is not None:
-            _mon_record(position_embeds, _mon, self._mon_slot_hook_pos_embed + _off, _anch)
-        else:
-            position_embeds = self.hook_pos_embed.monitor_activation(position_embeds)
+        position_embeds = self.hook_pos_embed(position_embeds)
         hidden_states = inputs_embeds + position_embeds.to(inputs_embeds.device)
 
         # Attention mask.
@@ -897,7 +811,6 @@ class GPT2Model(GPT2PreTrainedModel):
                 encoder_attention_mask=encoder_attention_mask,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                _mon_anchors=_anch,
                 **kwargs,
             )
 
@@ -909,13 +822,7 @@ class GPT2Model(GPT2PreTrainedModel):
                     all_cross_attentions = all_cross_attentions + (outputs[2],)
 
         hidden_states = self.ln_f(hidden_states)
-        if _mon is not None:
-            _mon_record(hidden_states, _mon, self._mon_slot_hook_final_ln + _off, _anch)
-        else:
-            hidden_states = self.hook_final_ln.monitor_activation(hidden_states)
-
-        if _anch:
-            torch.ops.graphmonitor_ops.anchor(_mon, _anch)
+        hidden_states = self.hook_final_ln(hidden_states)
 
         hidden_states = hidden_states.view(output_shape)
         # Add last hidden state
